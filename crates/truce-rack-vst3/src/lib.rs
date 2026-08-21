@@ -38,17 +38,21 @@ use std::ptr;
 
 use vst3::Steinberg::Vst::{
     AudioBusBuffers, AudioBusBuffers__type0, Event, Event_::EventTypes_, Event__type0,
-    IAudioProcessor, IAudioProcessorTrait, IComponent, IComponentTrait, IConnectionPoint,
+    IAudioProcessor, IAudioProcessorTrait, IComponent, IComponentHandler, IComponentHandler2,
+    IComponentHandler2Trait, IComponentHandlerTrait, IComponentTrait, IConnectionPoint,
     IConnectionPointTrait, IEditController, IEditControllerTrait, IEventList, IEventListTrait,
-    IParameterChanges, NoteOffEvent, NoteOnEvent, ParameterInfo as Vst3ParameterInfo,
-    ParameterInfo_::ParameterFlags_, PolyPressureEvent, ProcessContext as Vst3ProcessContext,
-    ProcessContext_::StatesAndFlags_, ProcessData, ProcessModes_, ProcessSetup,
-    SymbolicSampleSizes_, ViewType,
+    IHostApplication, IHostApplicationTrait, IParameterChanges, IParameterChangesTrait,
+    IParamValueQueue, IParamValueQueueTrait, NoteOffEvent, NoteOnEvent,
+    ParameterInfo as Vst3ParameterInfo, ParameterInfo_::ParameterFlags_, PolyPressureEvent,
+    ProcessContext as Vst3ProcessContext, ProcessContext_::StatesAndFlags_, ProcessData,
+    ProcessModes_, ProcessSetup, SymbolicSampleSizes_, ViewType, IUnitInfo, IUnitInfoTrait,
+    ProgramListInfo, String128,
 };
 use vst3::Steinberg::{
     IBStream, IBStreamTrait, IPlugView, IPlugViewTrait, IPluginBaseTrait, IPluginFactory,
-    IPluginFactoryTrait, PClassInfo, PClassInfo_, TUID, ViewRect, kPlatformTypeHWND,
-    kPlatformTypeNSView, kPlatformTypeX11EmbedWindowID, kResultOk, kResultTrue,
+    IPluginFactoryTrait, PClassInfo, PClassInfo_, TUID, ViewRect, kNoInterface,
+    kPlatformTypeHWND, kPlatformTypeNSView, kPlatformTypeX11EmbedWindowID, kResultFalse,
+    kResultOk, kResultTrue,
 };
 use vst3::{Class, ComPtr, ComWrapper};
 
@@ -72,6 +76,21 @@ const BUNDLE_EXIT_SYMBOL: &[u8] = b"bundleExit\0";
 /// Stereo speaker arrangement = `kSpeakerL | kSpeakerR`. Defined
 /// here to avoid a `kSpeaker*` import dance.
 const STEREO_ARRANGEMENT: u64 = 0x03;
+
+/// Mono arrangement (`kMono` in the SDK — a magic value, not a
+/// speaker bitmask). Used when the stream carries a single channel.
+const MONO_ARRANGEMENT: u64 = 524_288;
+
+/// Pick the speaker arrangement matching a channel count. Streams
+/// wider than stereo fall back to stereo: the music-player host
+/// feeds 1–2 channel PCM, and setBusArrangements negotiates down
+/// rather than up.
+fn arrangement_for_channels(channels: u32) -> u64 {
+    match channels {
+        1 => MONO_ARRANGEMENT,
+        _ => STEREO_ARRANGEMENT,
+    }
+}
 
 /// VST3 scanner.
 #[derive(Debug, Default)]
@@ -531,6 +550,27 @@ pub struct Vst3Plugin {
     param_count: usize,
     processing: bool,
 
+    /// Host-thread parameter changes queued while `processing` is
+    /// active. Drained into `inputParameterChanges` at the top of
+    /// every `process()` call — the spec-compliant way to move
+    /// real-time parameter edits into the audio thread.
+    pending_params: Vec<(u32, f64)>,
+
+    /// `IUnitInfo` when the controller exposes it (program lists /
+    /// presets). Queried best-effort at load.
+    unit_info: Option<ComPtr<IUnitInfo>>,
+    /// First program list with a non-zero program count, cached at
+    /// load so `preset_count` stays cheap. `None` when the plugin
+    /// exposes no factory programs.
+    program_list: Option<ProgramListInfo>,
+
+    /// Editor-driven parameter edits (performEdit from the plugin's
+    /// own GUI). Drained alongside `pending_params` in process().
+    sink: std::sync::Arc<ParamSink>,
+    /// Host context handed to initialize()/setComponentHandler.
+    /// Must outlive every interface pointer the plugin cached.
+    _host: ComWrapper<HostContext>,
+
     /// Cached `IPlugView` for the plugin's editor. Created on
     /// `open()`, released on `close()` / Drop.
     view: Option<ComPtr<IPlugView>>,
@@ -564,10 +604,23 @@ impl Vst3Plugin {
             })?;
         let component = component_ptr;
 
-        // Initialize the component. Many plugins accept a NULL
-        // context (hosts only need to supply IHostApplication for
-        // plugins that look it up via queryInterface).
-        if unsafe { component.initialize(ptr::null_mut()) } != kResultOk {
+        // Real host context: some plugins dereference the context in
+        // initialize() to reach IHostApplication, and the editor path
+        // needs IComponentHandler to route GUI knob drags back to us.
+        let sink = std::sync::Arc::new(ParamSink::default());
+        let host_wrapper = ComWrapper::new(HostContext {
+            sink: sink.clone(),
+        });
+        let host_app = host_wrapper.to_com_ptr::<IHostApplication>().ok_or_else(|| {
+            Error::LoadFailed {
+                path: info.path.clone(),
+                reason: "host context missing IHostApplication".into(),
+            }
+        })?;
+
+        // Initialize the component.
+        let host_ctx = host_app.as_ptr().cast::<vst3::Steinberg::FUnknown>();
+        if unsafe { component.initialize(host_ctx) } != kResultOk {
             return Err(Error::LoadFailed {
                 path: info.path.clone(),
                 reason: "IComponent::initialize returned non-OK".into(),
@@ -594,7 +647,7 @@ impl Vst3Plugin {
                     path: info.path.clone(),
                     reason: "factory.createInstance(IEditController) returned NULL".into(),
                 })?;
-            if unsafe { ctrl_ptr.initialize(ptr::null_mut()) } != kResultOk {
+            if unsafe { ctrl_ptr.initialize(host_ctx) } != kResultOk {
                 return Err(Error::LoadFailed {
                     path: info.path.clone(),
                     reason: "IEditController::initialize returned non-OK".into(),
@@ -636,9 +689,25 @@ impl Vst3Plugin {
             (None, None)
         };
 
+        // Hand the editor's param-edit entry point to the
+        // controller (beginEdit / performEdit / endEdit). GUI knob
+        // drags land in the shared sink from here on.
+        if let Some(handler) = host_wrapper.to_com_ptr::<IComponentHandler>() {
+            unsafe { controller.setComponentHandler(handler.as_ptr()) };
+        }
+
         let param_count_raw = unsafe { controller.getParameterCount() }.max(0);
         #[allow(clippy::cast_sign_loss)]
         let param_count = param_count_raw as usize;
+
+        // IUnitInfo lives on the controller in practice; fall back
+        // to the component for single-object plugins that put it
+        // there. Best-effort — plenty of plugins don't expose it.
+        let unit_info = controller
+            .as_com_ref()
+            .cast::<IUnitInfo>()
+            .or_else(|| component.as_com_ref().cast::<IUnitInfo>());
+        let program_list = unit_info.as_ref().and_then(|unit| first_program_list(unit));
 
         let mut info = info.clone();
         // The editor exists if `createView("editor")` returns a
@@ -660,10 +729,64 @@ impl Vst3Plugin {
             controller_cp,
             param_count,
             processing: false,
+            pending_params: Vec::new(),
+            unit_info,
+            program_list,
+            sink,
+            _host: host_wrapper,
             view: None,
             editor_open: false,
         })
     }
+
+    /// Find the parameter flagged `kIsProgramChange` — the knob VST3
+    /// uses to select factory programs.
+    fn find_program_change_parameter(&self) -> Result<u32> {
+        for index in 0..self.param_count {
+            let mut info = empty_parameter_info();
+            let Ok(i32_index) = i32::try_from(index) else {
+                break;
+            };
+            if unsafe { self.controller.getParameterInfo(i32_index, &raw mut info) } != kResultOk {
+                continue;
+            }
+            if info.flags & ParameterFlags_::kIsProgramChange != 0 {
+                return Ok(info.id);
+            }
+        }
+        Err(Error::Other(
+            "plugin exposes no kIsProgramChange parameter".into(),
+        ))
+    }
+}
+
+/// Decode a VST3 `String128` (UTF-16, NUL-terminated) into a Rust
+/// `String`, dropping anything after the first NUL. Thin re-export
+/// of the shared `&[u16; 128]` helper below.
+fn string128_to_string(buf: &String128) -> String {
+    string128_to_string_u16(buf)
+}
+
+/// Return the first program list carrying at least one program.
+/// Hosts that care about multi-list plugins (rare) enumerate
+/// `IUnitInfo::getProgramListCount` themselves.
+fn first_program_list(unit: &ComPtr<IUnitInfo>) -> Option<ProgramListInfo> {
+    let count = unsafe { unit.getProgramListCount() };
+    for list_index in 0..count.max(0) {
+        let mut info = ProgramListInfo {
+            id: 0,
+            name: [0; 128],
+            programCount: 0,
+        };
+        let status = unsafe { unit.getProgramListInfo(list_index, &raw mut info) };
+        if status != kResultOk {
+            continue;
+        }
+        if info.programCount > 0 {
+            return Some(info);
+        }
+    }
+    None
 }
 
 /// Call `IEditController::createView("editor")` and wrap the raw
@@ -769,13 +892,24 @@ impl PluginCore for Vst3Plugin {
         Ok(unsafe { self.controller.getParamNormalized(info.id) })
     }
 
-    fn parameter_value_string(&self, index: usize, _value: f64) -> Result<String> {
-        // VST3 exposes IEditController::getParamStringByValue —
-        // wiring it requires a TChar (UTF-16) buffer round-trip.
-        // Tracked as a follow-on to avoid pulling in a wide-char
-        // dep here.
-        let _ = index;
-        Err(Error::Other("vst3 parameter_value_string TODO".into()))
+    fn parameter_value_string(&self, index: usize, value: f64) -> Result<String> {
+        if index >= self.param_count {
+            return Err(Error::InvalidParameter(index));
+        }
+        let mut info = empty_parameter_info();
+        let i32_index = i32::try_from(index).map_err(|_| Error::InvalidParameter(index))?;
+        if unsafe { self.controller.getParameterInfo(i32_index, &raw mut info) } != kResultOk {
+            return Err(Error::InvalidParameter(index));
+        }
+        let mut out: String128 = [0; 128];
+        let status =
+            unsafe { self.controller.getParamStringByValue(info.id, value.clamp(0.0, 1.0), &raw mut out) };
+        if status != kResultOk {
+            return Err(Error::Other(
+                "IEditController::getParamStringByValue failed".into(),
+            ));
+        }
+        Ok(string128_to_string(&out))
     }
 
     fn set_parameter(&mut self, index: usize, value: f64) -> Result<()> {
@@ -788,6 +922,14 @@ impl PluginCore for Vst3Plugin {
             return Err(Error::InvalidParameter(index));
         }
         let clamped = value.clamp(0.0, 1.0);
+        // While the processor is running, calling setParamNormalized
+        // from the host thread races the audio thread. Queue the
+        // edit instead — process() forwards it through
+        // inputParameterChanges, which is the spec-compliant path.
+        if self.processing {
+            self.pending_params.push((info.id, clamped));
+            return Ok(());
+        }
         if unsafe { self.controller.setParamNormalized(info.id, clamped) } != kResultOk {
             return Err(Error::Other(
                 "IEditController::setParamNormalized failed".into(),
@@ -797,15 +939,66 @@ impl PluginCore for Vst3Plugin {
     }
 
     fn preset_count(&self) -> usize {
-        // VST3 exposes presets via the `IUnitInfo` interface,
-        // wired in a follow-on. Treat as zero for now.
-        0
+        self.program_list
+            .as_ref()
+            .map(|list| list.programCount.max(0) as usize)
+            .unwrap_or(0)
     }
     fn preset_info(&self, index: usize) -> Result<PresetInfo> {
-        Err(Error::InvalidParameter(index))
+        let list = self
+            .program_list
+            .as_ref()
+            .ok_or(Error::InvalidParameter(index))?;
+        #[allow(clippy::cast_possible_wrap)]
+        let program_index = i32::try_from(index).map_err(|_| Error::InvalidParameter(index))?;
+        if program_index >= list.programCount {
+            return Err(Error::InvalidParameter(index));
+        }
+        let Some(unit) = self.unit_info.as_ref() else {
+            return Err(Error::InvalidParameter(index));
+        };
+        let mut out: String128 = [0; 128];
+        let status = unsafe { unit.getProgramName(list.id, program_index, &raw mut out) };
+        if status != kResultOk {
+            return Err(Error::Other(
+                "IUnitInfo::getProgramName returned non-OK".into(),
+            ));
+        }
+        Ok(PresetInfo {
+            index,
+            name: string128_to_string(&out),
+            preset_number: program_index,
+        })
     }
-    fn load_preset(&mut self, _preset_number: i32) -> Result<()> {
-        Err(Error::Other("vst3 preset loading not yet wired".into()))
+    fn load_preset(&mut self, preset_number: i32) -> Result<()> {
+        let count = self.preset_count();
+        #[allow(clippy::cast_sign_loss)]
+        let count_u = count;
+        let index = usize::try_from(preset_number).map_err(|_| Error::InvalidParameter(usize::MAX))?;
+        if index >= count_u {
+            return Err(Error::InvalidParameter(index));
+        }
+        // VST3 selects a program by setting the unit's
+        // program-change parameter (the one flagged kIsProgramChange)
+        // to the program's normalized slot. Programs map onto
+        // [0, 1] evenly: index / (count - 1), or 0 for a lone
+        // program.
+        let program_param = self.find_program_change_parameter()?;
+        let normalized = if count_u > 1 {
+            preset_number as f64 / (count_u - 1) as f64
+        } else {
+            0.0
+        };
+        if self.processing {
+            self.pending_params.push((program_param, normalized));
+            return Ok(());
+        }
+        if unsafe { self.controller.setParamNormalized(program_param, normalized) } != kResultOk {
+            return Err(Error::Other(
+                "IEditController::setParamNormalized failed for program change".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn save_state(&self) -> Result<Vec<u8>> {
@@ -845,8 +1038,9 @@ impl PluginCore for Vst3Plugin {
         sample_rate: f64,
         max_block_size: usize,
     ) -> Result<()> {
-        let mut input_arr = STEREO_ARRANGEMENT;
-        let mut output_arr = STEREO_ARRANGEMENT;
+        let arrangement = arrangement_for_channels(layout.total_input_channels().max(1));
+        let mut input_arr = arrangement;
+        let mut output_arr = arrangement;
         let _ = unsafe {
             self.processor
                 .setBusArrangements(&raw mut input_arr, 1, &raw mut output_arr, 1)
@@ -1035,7 +1229,7 @@ fn vst3_param_info_to_rack(info: &Vst3ParameterInfo) -> ParameterInfo {
 
 /// VST3 `String128` is `[char16; 128]` (UTF-16). Walk the slice
 /// until the first NUL and decode to UTF-8.
-fn string128_to_string(buf: &[u16; 128]) -> String {
+fn string128_to_string_u16(buf: &[u16; 128]) -> String {
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..len])
 }
@@ -1147,6 +1341,27 @@ impl Plugin<f32> for Vst3Plugin {
             .transport
             .map(|t| build_vst3_context(&t, context.sample_rate));
 
+        // Forward queued host parameter edits through
+        // inputParameterChanges — the spec-compliant real-time path.
+        // Editor-driven performEdit traffic rides along. Wrappers
+        // stay alive until the process call returns.
+        let mut drained = std::mem::take(&mut self.pending_params);
+        drained.extend(self.sink.drain());
+        let mut queue_wrappers: Vec<ComWrapper<ParamQueue3>> = Vec::with_capacity(drained.len());
+        let mut queue_ptrs: Vec<ComPtr<IParamValueQueue>> = Vec::with_capacity(drained.len());
+        for (id, value) in drained {
+            let wrapper = ComWrapper::new(ParamQueue3 { id, value });
+            let Some(ptr) = wrapper.to_com_ptr::<IParamValueQueue>() else {
+                continue;
+            };
+            queue_wrappers.push(wrapper);
+            queue_ptrs.push(ptr);
+        }
+        let changes_wrapper = ComWrapper::new(ParamChanges3 {
+            queues: queue_ptrs,
+        });
+        let param_changes_ptr = changes_wrapper.to_com_ptr::<IParameterChanges>();
+
         let mut data = ProcessData {
             #[allow(clippy::cast_possible_wrap)]
             processMode: ProcessModes_::kRealtime as i32,
@@ -1157,7 +1372,9 @@ impl Plugin<f32> for Vst3Plugin {
             numOutputs: 1,
             inputs: &raw mut input_bus,
             outputs: &raw mut output_bus,
-            inputParameterChanges: ptr::null_mut::<IParameterChanges>(),
+            inputParameterChanges: param_changes_ptr
+                .as_ref()
+                .map_or(ptr::null_mut(), |p| p.as_ptr()),
             outputParameterChanges: ptr::null_mut::<IParameterChanges>(),
             inputEvents: input_events_ptr.as_ptr(),
             outputEvents: output_events_ptr.as_ptr(),
@@ -1311,8 +1528,183 @@ impl IEventListTrait for EventList3 {
 }
 
 // ---------------------------------------------------------------------------
-// MemoryStream — in-memory IBStream impl for state save/load.
+// ParamChanges3 / ParamQueue3 — inputParameterChanges forwarding.
 // ---------------------------------------------------------------------------
+
+/// One queued parameter edit: a single point at sample offset 0
+/// carrying the parameter's new normalized value.
+struct ParamQueue3 {
+    id: u32,
+    value: f64,
+}
+
+impl Class for ParamQueue3 {
+    type Interfaces = (IParamValueQueue,);
+}
+
+impl IParamValueQueueTrait for ParamQueue3 {
+    unsafe fn getParameterId(&self) -> u32 {
+        self.id
+    }
+
+    unsafe fn getPointCount(&self) -> i32 {
+        1
+    }
+
+    unsafe fn getPoint(&self, index: i32, sample_offset: *mut i32, value: *mut f64) -> i32 {
+        if index != 0 {
+            return kResultFalse;
+        }
+        if !sample_offset.is_null() {
+            unsafe { *sample_offset = 0 };
+        }
+        if !value.is_null() {
+            unsafe { *value = self.value };
+        }
+        kResultOk
+    }
+
+    unsafe fn addPoint(&self, _offset: i32, _value: f64, _index: *mut i32) -> i32 {
+        // Read-only from the plugin's perspective; hosts pre-fill.
+        kResultFalse
+    }
+}
+
+/// `IParameterChanges` aggregating this block's queues. Plugins
+/// only read through `getParameterData`; `addParameterData` is a
+/// host-side fill API and reports unsupported.
+struct ParamChanges3 {
+    queues: Vec<ComPtr<IParamValueQueue>>,
+}
+
+impl Class for ParamChanges3 {
+    type Interfaces = (IParameterChanges,);
+}
+
+impl IParameterChangesTrait for ParamChanges3 {
+    unsafe fn getParameterCount(&self) -> i32 {
+        i32::try_from(self.queues.len()).unwrap_or(i32::MAX)
+    }
+
+    unsafe fn getParameterData(&self, index: i32) -> *mut IParamValueQueue {
+        if index < 0 {
+            return ptr::null_mut();
+        }
+        self.queues
+            .get(index as usize)
+            .map_or(ptr::null_mut(), |q| q.as_ptr())
+    }
+
+    unsafe fn addParameterData(&self, _id: *const u32, _index: *mut i32) -> *mut IParamValueQueue {
+        ptr::null_mut()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HostContext — IHostApplication + IComponentHandler(2) handed to the
+// plugin so editors can talk back (performEdit) and initialize()
+// never sees a NULL context.
+// ---------------------------------------------------------------------------
+
+/// Cross-thread mailbox for editor-driven parameter edits. The COM
+/// host object pushes from whatever thread the plugin calls
+/// performEdit on; `process()` drains on the audio thread.
+#[derive(Default)]
+pub(crate) struct ParamSink {
+    edits: std::sync::Mutex<Vec<(u32, f64)>>,
+}
+
+impl ParamSink {
+    fn push(&self, id: u32, value: f64) {
+        let mut guard = self.edits.lock().unwrap_or_else(|e| e.into_inner());
+        guard.push((id, value));
+    }
+
+    fn drain(&self) -> Vec<(u32, f64)> {
+        let mut guard = self.edits.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *guard)
+    }
+}
+
+/// Host application name reported through IHostApplication::getName.
+const HOST_APP_NAME: &str = "XianYu Music";
+
+struct HostContext {
+    sink: std::sync::Arc<ParamSink>,
+}
+
+impl Class for HostContext {
+    type Interfaces = (IHostApplication, IComponentHandler, IComponentHandler2);
+}
+
+impl IHostApplicationTrait for HostContext {
+    unsafe fn getName(&self, name: *mut String128) -> i32 {
+        if name.is_null() {
+            return kResultFalse;
+        }
+        let units: Vec<u16> = HOST_APP_NAME.encode_utf16().collect();
+        let out = unsafe { &mut *name };
+        out.fill(0);
+        for (slot, unit) in units.into_iter().take(out.len() - 1).enumerate() {
+            out[slot] = unit;
+        }
+        kResultOk
+    }
+
+    unsafe fn createInstance(
+        &self,
+        _cid: *mut TUID,
+        _iid: *mut TUID,
+        obj: *mut *mut std::ffi::c_void,
+    ) -> i32 {
+        if !obj.is_null() {
+            unsafe { *obj = ptr::null_mut() };
+        }
+        kNoInterface
+    }
+}
+
+impl IComponentHandlerTrait for HostContext {
+    unsafe fn beginEdit(&self, _id: u32) -> i32 {
+        kResultOk
+    }
+
+    unsafe fn performEdit(&self, id: u32, value_normalized: f64) -> i32 {
+        // The plugin's editor moved a control. Queue it for the
+        // next process() call; the controller's own state is
+        // already up to date (it initiated the edit).
+        self.sink.push(id, value_normalized.clamp(0.0, 1.0));
+        kResultOk
+    }
+
+    unsafe fn endEdit(&self, _id: u32) -> i32 {
+        kResultOk
+    }
+
+    unsafe fn restartComponent(&self, _flags: i32) -> i32 {
+        // Latency/buses may have changed; the music-player host
+        // ignores this — the rack keeps its negotiated layout.
+        kResultOk
+    }
+}
+
+impl IComponentHandler2Trait for HostContext {
+    unsafe fn setDirty(&self, _state: u8) -> i32 {
+        kResultOk
+    }
+
+    unsafe fn requestOpenEditor(&self, _name: *const i8) -> i32 {
+        kResultFalse
+    }
+
+    unsafe fn startGroupEdit(&self) -> i32 {
+        kResultOk
+    }
+
+    unsafe fn finishGroupEdit(&self) -> i32 {
+        kResultOk
+    }
+}
 
 /// Backing storage for the `IBStream` we hand to
 /// `IComponent::setState` / `getState`. The plugin reads and

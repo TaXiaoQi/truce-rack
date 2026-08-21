@@ -50,8 +50,12 @@ use clap_sys::ext::params::{
     clap_plugin_params,
 };
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_plugin_state};
+use clap_sys::ext::timer_support::{
+    CLAP_EXT_TIMER_SUPPORT, clap_host_timer_support, clap_plugin_timer_support,
+};
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
 use clap_sys::host::clap_host;
+use clap_sys::id::clap_id;
 use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
 use clap_sys::process::{
     CLAP_PROCESS_CONTINUE, CLAP_PROCESS_CONTINUE_IF_NOT_QUIET, CLAP_PROCESS_ERROR,
@@ -63,6 +67,9 @@ use clap_sys::version::CLAP_VERSION;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 /// Format identifier — used as the `format` field on
 /// [`PluginInfo`] entries this crate returns.
@@ -76,12 +83,18 @@ pub const CLAP_EXTENSION: &str = ".clap";
 const ENTRY_SYMBOL: &[u8] = b"clap_entry\0";
 
 // ---------------------------------------------------------------------------
-// Minimal `clap_host` passed to `clap_plugin_factory::create_plugin`.
+// Per-plugin `clap_host` handed to `clap_plugin_factory::create_plugin`.
 //
 // The CLAP spec requires a non-null host; plugins commonly assert on
-// it (nih-plug does). This stub advertises no host extensions and
-// ignores restart/process/callback requests, which is enough for
-// offline (non-GUI) hosting.
+// it (nih-plug does). The host advertises the `clap.timer-support`
+// extension so editors can register idle timers, and honors
+// `request_callback` by deferring `clap_plugin::on_main_thread` to
+// the next [`PluginEditor::on_idle`] tick on the editor thread.
+//
+// The `clap_host` struct and its `host_data` target live on the heap
+// (owned by [`ClapPlugin`]) because the plugin caches the host
+// pointer for its whole lifetime — a stack or inline copy would
+// dangle as soon as `ClapPlugin` moves.
 // ---------------------------------------------------------------------------
 
 const HOST_NAME: &[u8] = b"truce-rack host\0";
@@ -89,29 +102,104 @@ const HOST_VENDOR: &[u8] = b"truce-audio\0";
 const HOST_URL: &[u8] = b"https://github.com/truce-audio/truce-rack\0";
 const HOST_VERSION: &[u8] = b"1.1.5\0";
 
+/// One timer the plugin registered through `clap.host_timer-support`.
+struct HostTimerEntry {
+    timer_id: clap_id,
+    period_ms: u32,
+    next_due: Instant,
+}
+
+/// Timer bookkeeping shared between the host callbacks and the
+/// editor idle tick. The Mutex is only contended when the plugin
+/// re-registers timers from inside `on_timer` — the lock is never
+/// held while a plugin callback runs, so that path cannot deadlock.
+struct HostTimers {
+    entries: Vec<HostTimerEntry>,
+    next_timer_id: clap_id,
+}
+
+/// `host_data` target for the per-plugin host. `request_callback`
+/// may fire on any thread, hence the atomic; timer registration only
+/// happens on the main (editor) thread.
+struct HostState {
+    timers: Mutex<HostTimers>,
+    callback_requested: AtomicBool,
+}
+
+static HOST_TIMER_SUPPORT: clap_host_timer_support = clap_host_timer_support {
+    register_timer: Some(host_register_timer),
+    unregister_timer: Some(host_unregister_timer),
+};
+
+/// Fetch the [`HostState`] a `clap_host` points at, if any.
+///
+/// # Safety
+/// `host` must be a host struct this crate handed to a live plugin;
+/// the returned borrow is only valid while that plugin exists.
+unsafe fn host_state_of<'a>(host: *const clap_host) -> Option<&'a HostState> {
+    if host.is_null() {
+        return None;
+    }
+    let data = unsafe { (*host).host_data }.cast::<HostState>();
+    unsafe { data.as_ref() }
+}
+
 unsafe extern "C" fn host_get_extension(
-    _host: *const clap_host,
-    _extension_id: *const c_char,
+    host: *const clap_host,
+    extension_id: *const c_char,
 ) -> *const c_void {
+    if extension_id.is_null() {
+        return ptr::null();
+    }
+    if unsafe { CStr::from_ptr(extension_id) } == CLAP_EXT_TIMER_SUPPORT
+        && unsafe { host_state_of(host) }.is_some()
+    {
+        return (&raw const HOST_TIMER_SUPPORT).cast();
+    }
     ptr::null()
 }
 
 unsafe extern "C" fn host_request_restart(_host: *const clap_host) {}
 unsafe extern "C" fn host_request_process(_host: *const clap_host) {}
-unsafe extern "C" fn host_request_callback(_host: *const clap_host) {}
 
-static MINIMAL_HOST: clap_host = clap_host {
-    clap_version: CLAP_VERSION,
-    host_data: ptr::null_mut(),
-    name: HOST_NAME.as_ptr().cast(),
-    vendor: HOST_VENDOR.as_ptr().cast(),
-    url: HOST_URL.as_ptr().cast(),
-    version: HOST_VERSION.as_ptr().cast(),
-    get_extension: Some(host_get_extension),
-    request_restart: Some(host_request_restart),
-    request_process: Some(host_request_process),
-    request_callback: Some(host_request_callback),
-};
+unsafe extern "C" fn host_request_callback(host: *const clap_host) {
+    if let Some(state) = unsafe { host_state_of(host) } {
+        state.callback_requested.store(true, Ordering::Release);
+    }
+}
+
+unsafe extern "C" fn host_register_timer(
+    host: *const clap_host,
+    period_ms: u32,
+    timer_id: *mut clap_id,
+) -> bool {
+    let Some(state) = (unsafe { host_state_of(host) }) else {
+        return false;
+    };
+    if timer_id.is_null() || period_ms == 0 {
+        return false;
+    }
+    let mut timers = state.timers.lock().unwrap_or_else(|e| e.into_inner());
+    let id = timers.next_timer_id;
+    timers.next_timer_id = timers.next_timer_id.wrapping_add(1);
+    timers.entries.push(HostTimerEntry {
+        timer_id: id,
+        period_ms,
+        next_due: Instant::now(),
+    });
+    unsafe { *timer_id = id };
+    true
+}
+
+unsafe extern "C" fn host_unregister_timer(host: *const clap_host, timer_id: clap_id) -> bool {
+    let Some(state) = (unsafe { host_state_of(host) }) else {
+        return false;
+    };
+    let mut timers = state.timers.lock().unwrap_or_else(|e| e.into_inner());
+    let before = timers.entries.len();
+    timers.entries.retain(|entry| entry.timer_id != timer_id);
+    timers.entries.len() < before
+}
 
 /// CLAP scanner.
 ///
@@ -509,6 +597,17 @@ pub struct ClapPlugin {
     /// plugin is processing; drained into the next `process` call's
     /// input events.
     pending_param_changes: Vec<(u32, f64)>,
+    /// Per-instance `clap_host` handed to the plugin at creation.
+    /// Boxed so the address the plugin caches stays valid no matter
+    /// how often `ClapPlugin` itself moves. Never read after
+    /// construction — the field exists purely to own the allocation.
+    #[allow(dead_code)]
+    host: Box<clap_host>,
+    /// `host_data` target backing the host callbacks.
+    host_state: Box<HostState>,
+    /// Cached `clap.timer-support` extension (plugin side). NULL
+    /// when the plugin doesn't use idle timers.
+    timer_ext: *const clap_plugin_timer_support,
 }
 
 // SAFETY: The CLAP spec is explicit that a plugin handle may be
@@ -540,8 +639,30 @@ impl ClapPlugin {
             path: bundle_path.clone(),
             reason: format!("plugin id is not a valid C string: {e}"),
         })?;
-        let host = &raw const MINIMAL_HOST;
-        let plugin = unsafe { create(factory, host, id_cstring.as_ptr()) };
+        // Per-plugin host: the plugin caches this pointer for its
+        // whole lifetime, so both the host struct and its
+        // `host_data` target are heap-allocated and owned by the
+        // returned ClapPlugin.
+        let host_state = Box::new(HostState {
+            timers: Mutex::new(HostTimers {
+                entries: Vec::new(),
+                next_timer_id: 1,
+            }),
+            callback_requested: AtomicBool::new(false),
+        });
+        let host = Box::new(clap_host {
+            clap_version: CLAP_VERSION,
+            host_data: (&raw const *host_state).cast::<c_void>().cast_mut(),
+            name: HOST_NAME.as_ptr().cast(),
+            vendor: HOST_VENDOR.as_ptr().cast(),
+            url: HOST_URL.as_ptr().cast(),
+            version: HOST_VERSION.as_ptr().cast(),
+            get_extension: Some(host_get_extension),
+            request_restart: Some(host_request_restart),
+            request_process: Some(host_request_process),
+            request_callback: Some(host_request_callback),
+        });
+        let plugin = unsafe { create(factory, &*host, id_cstring.as_ptr()) };
         if plugin.is_null() {
             unsafe { entry.deinit() };
             return Err(Error::LoadFailed {
@@ -566,6 +687,8 @@ impl ClapPlugin {
         let params_ext = unsafe { lookup_extension::<clap_plugin_params>(plugin, CLAP_EXT_PARAMS) };
         let state_ext = unsafe { lookup_extension::<clap_plugin_state>(plugin, CLAP_EXT_STATE) };
         let gui_ext = unsafe { lookup_extension::<clap_plugin_gui>(plugin, CLAP_EXT_GUI) };
+        let timer_ext =
+            unsafe { lookup_extension::<clap_plugin_timer_support>(plugin, CLAP_EXT_TIMER_SUPPORT) };
         let mut info = info.clone();
         if !gui_ext.is_null() && unsafe { gui_supports_current_platform(plugin, gui_ext) } {
             info.has_editor = true;
@@ -584,6 +707,9 @@ impl ClapPlugin {
             gui_open: false,
             steady_time: 0,
             pending_param_changes: Vec::new(),
+            host,
+            host_state,
+            timer_ext,
         })
     }
 }
@@ -974,6 +1100,60 @@ impl truce_rack_core::editor::PluginEditor for ClapPlugin {
     fn hide(&mut self) {
         if let Some(hide) = unsafe { (*self.gui_ext).hide } {
             let _ = unsafe { hide(self.plugin) };
+        }
+    }
+
+    /// Drive the plugin's GUI: deliver due `clap.timer-support`
+    /// timers and honor `request_callback` by invoking
+    /// `clap_plugin::on_main_thread`. Hosts call this from their
+    /// editor window's idle tick (see the trait's `on_idle` docs)
+    /// — without it, iced/VSTGUI-based CLAP editors never repaint
+    /// or process user events.
+    fn on_idle(&mut self) {
+        if self
+            .host_state
+            .callback_requested
+            .swap(false, Ordering::AcqRel)
+            && let Some(on_main_thread) = unsafe { (*self.plugin).on_main_thread }
+        {
+            unsafe { on_main_thread(self.plugin) };
+        }
+
+        let now = Instant::now();
+        // Collect due ids under the lock, then dispatch outside it:
+        // on_timer may call register/unregister_timer re-entrantly.
+        let due: Vec<clap_id> = {
+            let mut timers = self.host_state.timers.lock().unwrap_or_else(|e| e.into_inner());
+            timers
+                .entries
+                .iter_mut()
+                .filter_map(|entry| {
+                    if now >= entry.next_due {
+                        entry.next_due =
+                            now + Duration::from_millis(u64::from(entry.period_ms.max(1)));
+                        Some(entry.timer_id)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        if due.is_empty() {
+            return;
+        }
+        if self.timer_ext.is_null() {
+            self.timer_ext = unsafe {
+                lookup_extension::<clap_plugin_timer_support>(self.plugin, CLAP_EXT_TIMER_SUPPORT)
+            };
+        }
+        if self.timer_ext.is_null() {
+            return;
+        }
+        let Some(on_timer) = (unsafe { (*self.timer_ext).on_timer }) else {
+            return;
+        };
+        for timer_id in due {
+            unsafe { on_timer(self.plugin, timer_id) };
         }
     }
 }
@@ -1609,5 +1789,61 @@ mod tests {
         assert!(!p.exists() || p.starts_with("/tmp/MyPlugin.clap"));
         #[cfg(not(target_os = "macos"))]
         assert_eq!(p, Path::new("/tmp/MyPlugin.clap"));
+    }
+
+    /// Host-callback plumbing for `clap.timer-support` and
+    /// `request_callback`, exercised without a real plugin: a host
+    /// struct whose `host_data` points at a boxed [`HostState`].
+    #[test]
+    fn host_timer_callbacks_bookkeep() {
+        let state = Box::new(HostState {
+            timers: Mutex::new(HostTimers {
+                entries: Vec::new(),
+                next_timer_id: 1,
+            }),
+            callback_requested: AtomicBool::new(false),
+        });
+        let host = clap_host {
+            clap_version: CLAP_VERSION,
+            host_data: (&raw const *state).cast::<c_void>().cast_mut(),
+            name: HOST_NAME.as_ptr().cast(),
+            vendor: HOST_VENDOR.as_ptr().cast(),
+            url: HOST_URL.as_ptr().cast(),
+            version: HOST_VERSION.as_ptr().cast(),
+            get_extension: Some(host_get_extension),
+            request_restart: Some(host_request_restart),
+            request_process: Some(host_request_process),
+            request_callback: Some(host_request_callback),
+        };
+
+        // timer-support is advertised; unknown extensions are not
+        let ext = unsafe { host_get_extension(&host, CLAP_EXT_TIMER_SUPPORT.as_ptr()) };
+        assert!(!ext.is_null());
+        let unknown = b"clap.unknown-ext\0";
+        assert!(unsafe { host_get_extension(&host, unknown.as_ptr().cast()) }.is_null());
+
+        // register -> distinct ids, zero period rejected
+        let mut id1: clap_id = 0;
+        let mut id2: clap_id = 0;
+        let mut bad: clap_id = 0;
+        assert!(unsafe { host_register_timer(&host, 30, &raw mut id1) });
+        assert!(unsafe { host_register_timer(&host, 60, &raw mut id2) });
+        assert_ne!(id1, id2);
+        assert!(!unsafe { host_register_timer(&host, 0, &raw mut bad) });
+
+        // request_callback round-trips through the atomic flag
+        assert!(!state.callback_requested.load(Ordering::Acquire));
+        unsafe { host_request_callback(&host) };
+        assert!(state.callback_requested.swap(false, Ordering::AcqRel));
+
+        // unregister removes exactly one entry, second attempt fails
+        assert!(unsafe { host_unregister_timer(&host, id1) });
+        assert!(!unsafe { host_unregister_timer(&host, id1) });
+        {
+            let timers = state.timers.lock().unwrap();
+            assert_eq!(timers.entries.len(), 1);
+            assert_eq!(timers.entries[0].timer_id, id2);
+            assert_eq!(timers.entries[0].period_ms, 60);
+        }
     }
 }
