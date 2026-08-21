@@ -518,8 +518,6 @@ pub struct Vst3Plugin {
     layouts: Vec<BusLayout>,
     active_layout: Option<BusLayout>,
 
-    // Hold the module open for the lifetime of the instance.
-    _module: LoadedModule,
     component: ComPtr<IComponent>,
     processor: ComPtr<IAudioProcessor>,
     controller: ComPtr<IEditController>,
@@ -537,6 +535,13 @@ pub struct Vst3Plugin {
     /// `open()`, released on `close()` / Drop.
     view: Option<ComPtr<IPlugView>>,
     editor_open: bool,
+
+    // Hold the module open for the lifetime of the instance.
+    // MUST be the last field: Rust drops fields in declaration
+    // order, so the DLL unloads only after every ComPtr above
+    // has released its reference (otherwise Release() jumps into
+    // unloaded code → STATUS_ACCESS_VIOLATION).
+    _module: LoadedModule,
 }
 
 impl Vst3Plugin {
