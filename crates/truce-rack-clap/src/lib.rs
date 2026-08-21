@@ -51,14 +51,16 @@ use clap_sys::ext::params::{
 };
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_plugin_state};
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
+use clap_sys::host::clap_host;
 use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
 use clap_sys::process::{
     CLAP_PROCESS_CONTINUE, CLAP_PROCESS_CONTINUE_IF_NOT_QUIET, CLAP_PROCESS_ERROR,
     CLAP_PROCESS_SLEEP, CLAP_PROCESS_TAIL, clap_process,
 };
 use clap_sys::stream::{clap_istream, clap_ostream};
+use clap_sys::version::CLAP_VERSION;
 
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
 
@@ -72,6 +74,44 @@ pub const CLAP_EXTENSION: &str = ".clap";
 
 /// Symbol name `clap_entry` plugins must export.
 const ENTRY_SYMBOL: &[u8] = b"clap_entry\0";
+
+// ---------------------------------------------------------------------------
+// Minimal `clap_host` passed to `clap_plugin_factory::create_plugin`.
+//
+// The CLAP spec requires a non-null host; plugins commonly assert on
+// it (nih-plug does). This stub advertises no host extensions and
+// ignores restart/process/callback requests, which is enough for
+// offline (non-GUI) hosting.
+// ---------------------------------------------------------------------------
+
+const HOST_NAME: &[u8] = b"truce-rack host\0";
+const HOST_VENDOR: &[u8] = b"truce-audio\0";
+const HOST_URL: &[u8] = b"https://github.com/truce-audio/truce-rack\0";
+const HOST_VERSION: &[u8] = b"1.1.5\0";
+
+unsafe extern "C" fn host_get_extension(
+    _host: *const clap_host,
+    _extension_id: *const c_char,
+) -> *const c_void {
+    ptr::null()
+}
+
+unsafe extern "C" fn host_request_restart(_host: *const clap_host) {}
+unsafe extern "C" fn host_request_process(_host: *const clap_host) {}
+unsafe extern "C" fn host_request_callback(_host: *const clap_host) {}
+
+static MINIMAL_HOST: clap_host = clap_host {
+    clap_version: CLAP_VERSION,
+    host_data: ptr::null_mut(),
+    name: HOST_NAME.as_ptr().cast(),
+    vendor: HOST_VENDOR.as_ptr().cast(),
+    url: HOST_URL.as_ptr().cast(),
+    version: HOST_VERSION.as_ptr().cast(),
+    get_extension: Some(host_get_extension),
+    request_restart: Some(host_request_restart),
+    request_process: Some(host_request_process),
+    request_callback: Some(host_request_callback),
+};
 
 /// CLAP scanner.
 ///
@@ -500,7 +540,7 @@ impl ClapPlugin {
             path: bundle_path.clone(),
             reason: format!("plugin id is not a valid C string: {e}"),
         })?;
-        let host = ptr::null(); // TODO(truce-rack): supply a real clap_host.
+        let host = &raw const MINIMAL_HOST;
         let plugin = unsafe { create(factory, host, id_cstring.as_ptr()) };
         if plugin.is_null() {
             unsafe { entry.deinit() };
