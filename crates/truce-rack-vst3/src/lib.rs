@@ -50,7 +50,7 @@ use vst3::Steinberg::Vst::{
 };
 use vst3::Steinberg::{
     IBStream, IBStreamTrait, IPlugView, IPlugViewTrait, IPluginBaseTrait, IPluginFactory,
-    IPluginFactoryTrait, PClassInfo, PClassInfo_, TUID, ViewRect, kNoInterface,
+    IPluginFactoryTrait, PClassInfo, PClassInfo_, PFactoryInfo, TUID, ViewRect, kNoInterface,
     kPlatformTypeHWND, kPlatformTypeNSView, kPlatformTypeX11EmbedWindowID, kResultFalse,
     kResultOk, kResultTrue,
 };
@@ -181,6 +181,7 @@ fn scan_dir_into(dir: &Path, out: &mut Vec<PluginInfo>) {
 fn scan_bundle_into(bundle: &Path, out: &mut Vec<PluginInfo>) -> Result<()> {
     let module = unsafe { LoadedModule::open(bundle) }?;
     let factory = module.factory()?;
+    let vendor = read_factory_vendor(&factory);
     let count = unsafe { factory.countClasses() };
     let mut info = empty_pclass_info();
     for idx in 0..count {
@@ -194,7 +195,7 @@ fn scan_bundle_into(bundle: &Path, out: &mut Vec<PluginInfo>) -> Result<()> {
         let name = char8_array_to_string(&info.name);
         out.push(PluginInfo {
             name,
-            vendor: String::new(),
+            vendor: vendor.clone(),
             version: 0,
             category: PluginCategory::Effect,
             path: bundle.to_path_buf(),
@@ -205,6 +206,20 @@ fn scan_bundle_into(bundle: &Path, out: &mut Vec<PluginInfo>) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// 读取 VST3 工厂（Installer/厂商）名。
+///
+/// `PClassInfo`（`getClassInfo`）不含厂商字段；标准途径是
+/// `IPluginFactory::getFactoryInfo` 返回 `PFactoryInfo.vendor`。
+/// 部分插件实现未填该字段，此时回退为空（与原有行为一致）。
+fn read_factory_vendor(factory: &ComPtr<IPluginFactory>) -> String {
+    let mut factory_info = unsafe { std::mem::zeroed::<PFactoryInfo>() };
+    let result = unsafe { factory.getFactoryInfo(&mut factory_info) };
+    if result != kResultOk || factory_info.vendor[0] == 0 {
+        return String::new();
+    }
+    char8_array_to_string(&factory_info.vendor)
 }
 
 fn empty_pclass_info() -> PClassInfo {
