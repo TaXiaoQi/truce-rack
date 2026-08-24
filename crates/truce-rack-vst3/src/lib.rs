@@ -102,6 +102,18 @@ impl Vst3Scanner {
     pub fn new() -> Self {
         Self
     }
+
+    /// Scan a single VST3 bundle directory and return its plugin infos.
+    ///
+    /// Unlike [`PluginScanner::scan_path`] — which expects a directory
+    /// *containing* `.vst3` bundles — this scans the bundle itself.
+    pub fn scan_bundle(&self, bundle: &Path) -> Result<Vec<PluginInfo>> {
+        let mut out = Vec::new();
+        if bundle.exists() {
+            scan_bundle_into(bundle, &mut out)?;
+        }
+        Ok(out)
+    }
 }
 
 impl PluginScanner for Vst3Scanner {

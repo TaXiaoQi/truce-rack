@@ -219,6 +219,18 @@ impl ClapScanner {
     pub fn new() -> Self {
         Self
     }
+
+    /// Scan a single CLAP bundle and return its plugin infos.
+    ///
+    /// Unlike [`PluginScanner::scan_path`] — which expects a directory
+    /// *containing* `.clap` bundles — this scans the bundle itself.
+    pub fn scan_bundle(&self, bundle_path: &Path) -> Result<Vec<PluginInfo>> {
+        let mut out = Vec::new();
+        if bundle_path.exists() {
+            scan_bundle_into(bundle_path, &mut out)?;
+        }
+        Ok(out)
+    }
 }
 
 impl PluginScanner for ClapScanner {
