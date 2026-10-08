@@ -244,7 +244,9 @@ fn empty_pclass_info() -> PClassInfo {
 }
 
 #[allow(clippy::cast_sign_loss)]
-fn char8_array_to_string(array: &[i8]) -> String {
+// VST3 的 char8/TUID 跟随 c_char：aarch64 Linux 上是 u8，x86/Windows 上是 i8，
+// 因此本文件一律用 c_char 与 FFI 结构体字段保持同型。
+fn char8_array_to_string(array: &[std::ffi::c_char]) -> String {
     // VST3 char8 is signed on Apple, unsigned elsewhere; the cast
     // preserves bit pattern.
     let bytes: Vec<u8> = array
@@ -256,7 +258,7 @@ fn char8_array_to_string(array: &[i8]) -> String {
 }
 
 #[allow(clippy::cast_sign_loss)]
-fn tuid_to_hex(cid: &[i8; 16]) -> String {
+fn tuid_to_hex(cid: &[std::ffi::c_char; 16]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(32);
     for &b in cid {
@@ -272,7 +274,7 @@ fn hex_to_tuid(hex: &str) -> Option<TUID> {
     }
     let mut out: TUID = [0; 16];
     for i in 0..16 {
-        out[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()? as i8;
+        out[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()? as std::ffi::c_char;
     }
     Some(out)
 }
@@ -828,7 +830,7 @@ unsafe fn create_editor_view(controller: &ComPtr<IEditController>) -> Option<Com
 
 fn platform_type_for_handle(
     handle: truce_rack_core::editor::WindowHandle,
-) -> (*const i8, *mut std::ffi::c_void) {
+) -> (*const std::ffi::c_char, *mut std::ffi::c_void) {
     use truce_rack_core::editor::WindowHandle;
     match handle {
         WindowHandle::NSView(p) => (kPlatformTypeNSView, p),
@@ -846,7 +848,7 @@ where
 {
     let mut obj: *mut std::ffi::c_void = ptr::null_mut();
     // `com_scrape_types::Guid` and `TUID` share the same
-    // `[i8; 16]` layout — reinterpret to avoid an extra copy.
+    // `[c_char; 16]` layout — reinterpret to avoid an extra copy.
     let iid_bytes: &TUID =
         unsafe { &*(std::ptr::from_ref::<vst3::com_scrape_types::Guid>(&I::IID).cast::<TUID>()) };
     let cid_ptr = cid.as_ptr();
@@ -1720,7 +1722,7 @@ impl IComponentHandler2Trait for HostContext {
         kResultOk
     }
 
-    unsafe fn requestOpenEditor(&self, _name: *const i8) -> i32 {
+    unsafe fn requestOpenEditor(&self, _name: *const std::ffi::c_char) -> i32 {
         kResultFalse
     }
 
@@ -1847,8 +1849,9 @@ mod tests {
 
     #[test]
     fn tuid_hex_roundtrip() {
+        // c_char 在 aarch64 上是 u8，负值需写成位模式（0xF0 as _ 跨平台同为 0xF0 位模式）。
         let cid: TUID = [
-            0x01, 0x23, 0x45, 0x67, -0x10, -0x10, -0x10, -0x10, 0, 0, 0, 0, 0, 0, 0, 0,
+            0x01, 0x23, 0x45, 0x67, 0xF0 as _, 0xF0 as _, 0xF0 as _, 0xF0 as _, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
         let hex = tuid_to_hex(&cid);
         let parsed = hex_to_tuid(&hex).expect("parse");
@@ -1857,11 +1860,11 @@ mod tests {
 
     #[test]
     fn char8_skips_trailing_nul() {
-        let mut arr = [0i8; 16];
+        let mut arr = [0 as std::ffi::c_char; 16];
         for (i, &b) in b"Hello".iter().enumerate() {
-            // ASCII byte → i8 always fits losslessly; the cast is
+            // ASCII byte → c_char always fits losslessly; the cast is
             // bit-pattern-identical for `b` < 128.
-            arr[i] = i8::try_from(b).expect("ASCII byte fits in i8");
+            arr[i] = std::ffi::c_char::try_from(b).expect("ASCII byte fits in c_char");
         }
         assert_eq!(char8_array_to_string(&arr), "Hello");
     }

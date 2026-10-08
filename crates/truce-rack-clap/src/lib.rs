@@ -830,7 +830,8 @@ impl PluginCore for ClapPlugin {
         let info = self.parameter_info(index)?;
         let value_to_text =
             unsafe { (*self.params_ext).value_to_text }.ok_or(Error::InvalidParameter(index))?;
-        let mut buf = [0i8; clap_sys::string_sizes::CLAP_NAME_SIZE];
+        // c_char 在 aarch64 Linux 上是 u8（x86 上是 i8），必须跟随平台定义而非硬编码 i8。
+        let mut buf = [0 as c_char; clap_sys::string_sizes::CLAP_NAME_SIZE];
         let buf_len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
         let ok = unsafe { value_to_text(self.plugin, info.id, value, buf.as_mut_ptr(), buf_len) };
         if !ok {
